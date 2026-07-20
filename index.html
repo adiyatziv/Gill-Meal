@@ -233,12 +233,12 @@
    4) Paste your web app config below instead of the placeholder.
    ============================================================ */
 const firebaseConfig = {
-  apiKey: "AIzaSyDTJeId-H-luwn5ukJ7UbNR3gCAbpb-Qhw",
-  authDomain: "gill-meal.firebaseapp.com",
-  projectId: "gill-meal",
-  storageBucket: "gill-meal.firebasestorage.app",
-  messagingSenderId: "1039435367048",
-  appId: "1:1039435367048:web:f4afa2476bfd22dbe9553d"
+  apiKey: "REPLACE_ME",
+  authDomain: "REPLACE_ME.firebaseapp.com",
+  projectId: "REPLACE_ME",
+  storageBucket: "REPLACE_ME.appspot.com",
+  messagingSenderId: "REPLACE_ME",
+  appId: "REPLACE_ME"
 };
 
 const NEEDS_SETUP = firebaseConfig.apiKey === "REPLACE_ME";
@@ -250,6 +250,8 @@ if(!NEEDS_SETUP){
 }
 const STORAGE_MODE = NEEDS_SETUP ? 'local' : 'firebase';
 let currentHouseholdId = null;
+function recipesCollection(){ return db.collection('households').doc(currentHouseholdId).collection('recipes'); }
+function sharedStateDoc(){ return db.collection('households').doc(currentHouseholdId).collection('app').doc('sharedState'); }
 
 /* ============================================================
    CONSTANTS
@@ -360,11 +362,72 @@ function fixSlot(slot){
    ============================================================ */
 function boot(){
   if(NEEDS_SETUP){ startAppLocal(); return; }
-  auth.onAuthStateChanged(user=>{
+  auth.onAuthStateChanged(async user=>{
     currentUser = user;
-    if(user) startApp();
+    if(user) await resolveHouseholdAndStart();
     else renderLogin();
   });
+}
+
+async function resolveHouseholdAndStart(){
+  try{
+    const userDoc = await db.collection('users').doc(currentUser.uid).get();
+    const data = userDoc.exists ? userDoc.data() : null;
+    if(data && data.householdId){
+      currentHouseholdId = data.householdId;
+      startApp();
+    } else {
+      renderHouseholdSetup();
+    }
+  }catch(e){
+    renderHouseholdSetup(e.message);
+  }
+}
+
+function renderHouseholdSetup(errorMsg){
+  const root = document.getElementById('app-root');
+  root.innerHTML = '';
+  const wrap = document.createElement('div'); wrap.className='auth-wrap';
+  const card = document.createElement('div'); card.className='auth-card';
+  card.innerHTML = `<h2 style="text-align:center;">כמעט שם!</h2><p class="muted" style="text-align:center;margin-bottom:18px;">כדי לשתף נתונים עם בן/בת הזוג, שניכם צריכים להיות ב"בית" משותף אחד.</p>`;
+  if(errorMsg){ const e=document.createElement('div'); e.className='muted'; e.style.color='var(--bad)'; e.style.marginBottom='10px'; e.textContent=errorMsg; card.appendChild(e); }
+
+  const createBtn = document.createElement('button'); createBtn.className='primary'; createBtn.style.width='100%'; createBtn.style.marginBottom='16px';
+  createBtn.textContent = '🏠 יצירת בית חדש';
+  createBtn.onclick = async ()=>{
+    const newId = uid()+uid();
+    try{
+      await db.collection('households').doc(newId).set({ createdAt: Date.now() });
+      await db.collection('users').doc(currentUser.uid).set({ householdId:newId, email: currentUser.email||'' });
+      currentHouseholdId = newId;
+      startApp();
+    }catch(e){ alert('שגיאה ביצירת בית: '+e.message); }
+  };
+  card.appendChild(createBtn);
+
+  const divider = document.createElement('div'); divider.className='muted'; divider.style.textAlign='center'; divider.style.margin='10px 0'; divider.textContent='— או —';
+  card.appendChild(divider);
+
+  const codeLabel = document.createElement('label'); codeLabel.textContent='קוד בית (קיבלת מבן/בת הזוג)'; card.appendChild(codeLabel);
+  const codeInput = document.createElement('input'); codeInput.placeholder='קוד הבית'; codeInput.style.marginBottom='10px';
+  card.appendChild(codeInput);
+  const joinBtn = document.createElement('button'); joinBtn.className='secondary'; joinBtn.style.width='100%';
+  joinBtn.textContent = 'הצטרפות לבית קיים';
+  joinBtn.onclick = async ()=>{
+    const code = codeInput.value.trim();
+    if(!code){ alert('צריך להדביק קוד בית'); return; }
+    try{
+      const hDoc = await db.collection('households').doc(code).get();
+      if(!hDoc.exists){ alert('לא נמצא בית עם הקוד הזה'); return; }
+      await db.collection('users').doc(currentUser.uid).set({ householdId:code, email: currentUser.email||'' });
+      currentHouseholdId = code;
+      startApp();
+    }catch(e){ alert('שגיאה בהצטרפות: '+e.message); }
+  };
+  card.appendChild(joinBtn);
+
+  wrap.appendChild(card);
+  root.appendChild(wrap);
 }
 
 function renderLogin(){
@@ -372,7 +435,7 @@ function renderLogin(){
   root.innerHTML = '';
   const wrap = document.createElement('div'); wrap.className='auth-wrap';
   const card = document.createElement('div'); card.className='auth-card';
-  card.innerHTML = `<h2 style="text-align:center;">המטבח שלנו</h2><p class="muted" style="text-align:center;margin-bottom:18px;">כניסה לשני המשתמשים המורשים בלבד</p>`;
+  card.innerHTML = `<h2 style="text-align:center;">המטבח שלנו</h2><p class="muted" style="text-align:center;margin-bottom:18px;">כניסה למשתמשים מורשים בלבד</p>`;
   const emailF = document.createElement('input'); emailF.type='email'; emailF.placeholder='אימייל'; emailF.style.marginBottom='10px';
   const passF = document.createElement('input'); passF.type='password'; passF.placeholder='סיסמה'; passF.style.marginBottom='14px';
   const err = document.createElement('div'); err.className='muted'; err.style.color='var(--bad)'; err.style.marginBottom='10px'; err.style.display='none';
@@ -443,13 +506,19 @@ function startApp(){
     <main id="main"></main>
     <nav class="bottom-nav" id="bottom-nav"></nav>
   `;
-  document.getElementById('signout-btn').onclick = ()=> auth.signOut();
+  document.getElementById('signout-btn').onclick = ()=>{
+    if(unsubState) unsubState();
+    if(unsubRecipes) unsubRecipes();
+    currentHouseholdId = null;
+    auth.signOut();
+  };
   document.getElementById('settings-btn').onclick = ()=>{ showSettingsView = true; render(); };
 
   STATE = JSON.parse(JSON.stringify(DEFAULT_STATE));
   STATE.recipes = [];
 
-  const stateRef = db.collection('app').doc('sharedState');
+  const householdRef = db.collection('households').doc(currentHouseholdId);
+  const stateRef = householdRef.collection('app').doc('sharedState');
   unsubState = stateRef.onSnapshot(doc=>{
     const data = doc.exists ? doc.data() : {};
     const recipes = STATE.recipes;
@@ -458,7 +527,7 @@ function startApp(){
     render();
   });
 
-  const recipesRef = db.collection('recipes').orderBy('createdAt','desc');
+  const recipesRef = householdRef.collection('recipes').orderBy('createdAt','desc');
   unsubRecipes = recipesRef.onSnapshot(snap=>{
     STATE.recipes = snap.docs.map(d=>Object.assign({id:d.id}, d.data()));
     render();
@@ -479,7 +548,7 @@ function saveState(){
       } else {
         const toSave = Object.assign({}, STATE);
         delete toSave.recipes;
-        await db.collection('app').doc('sharedState').set(toSave, {merge:false});
+        await sharedStateDoc().set(toSave, {merge:false});
       }
     }catch(e){ console.error('save failed', e); }
   }, 300);
@@ -918,6 +987,15 @@ function renderSettingsPage(){
   dh.appendChild(backBtn); dh.appendChild(titleEl);
   wrap.appendChild(dh);
   const body = document.createElement('div'); body.style.padding='16px';
+  if(STORAGE_MODE==='firebase' && currentHouseholdId){
+    const houseCard = document.createElement('div'); houseCard.className='card';
+    houseCard.innerHTML = `<h3>שיתוף עם בן/בת הזוג</h3><div class="muted" style="margin-bottom:8px;">כדי שמישהו נוסף יראה את אותם הנתונים, שיתפי איתו/ה את הקוד הזה — בכניסה הראשונה הוא/היא יבחרו "הצטרפות לבית קיים" ויזינו אותו.</div>`;
+    const codeBox = document.createElement('div'); codeBox.style.fontFamily='monospace'; codeBox.style.fontSize='16px'; codeBox.style.fontWeight='700';
+    codeBox.style.background='var(--paper-2)'; codeBox.style.padding='10px'; codeBox.style.borderRadius='var(--radius-sm)'; codeBox.style.textAlign='center'; codeBox.style.userSelect='all';
+    codeBox.textContent = currentHouseholdId;
+    houseCard.appendChild(codeBox);
+    body.appendChild(houseCard);
+  }
   body.appendChild(renderGoalsTab());
   wrap.appendChild(body);
   return wrap;
@@ -933,7 +1011,7 @@ function openRecipeDetail(id, scale){
   const r = recipeById(id);
   if(r){
     if(STORAGE_MODE==='local'){ r.lastOpenedAt = Date.now(); saveState(); }
-    else db.collection('recipes').doc(id).update({lastOpenedAt: Date.now()}).catch(()=>{});
+    else recipesCollection().doc(id).update({lastOpenedAt: Date.now()}).catch(()=>{});
   }
   render();
   window.scrollTo(0,0);
@@ -1582,7 +1660,7 @@ async function createRecipe(payload){
     STATE.recipes.push(payload);
     saveState();
   } else {
-    await db.collection('recipes').add(payload);
+    await recipesCollection().add(payload);
   }
 }
 
@@ -1592,7 +1670,7 @@ async function updateRecipeDoc(id, payload){
     if(idx>=0) STATE.recipes[idx] = Object.assign({}, STATE.recipes[idx], payload);
     saveState();
   } else {
-    await db.collection('recipes').doc(id).update(payload);
+    await recipesCollection().doc(id).update(payload);
   }
 }
 
@@ -1693,7 +1771,7 @@ async function saveRecipeFromForm(){
         if(idx>=0) STATE.recipes[idx] = Object.assign({}, STATE.recipes[idx], payload);
         saveState();
       } else {
-        await db.collection('recipes').doc(editingRecipeId).update(payload);
+        await recipesCollection().doc(editingRecipeId).update(payload);
       }
     } else {
       await createRecipe(payload);
@@ -2009,7 +2087,7 @@ async function deleteRecipe(id){
       STATE.recipes = STATE.recipes.filter(r=>r.id!==id);
       saveState();
     } else {
-      await db.collection('recipes').doc(id).delete();
+      await recipesCollection().doc(id).delete();
     }
     showAddForm=false; editingRecipeId=null;
     if(recipeDetailId===id) closeRecipeDetail(); else render();
@@ -2093,7 +2171,7 @@ function renderRecipeDetailPage(id){
     starBtn.onclick = ()=>{
       const newRating = currentRating===i ? 0 : i;
       if(STORAGE_MODE==='local'){ r.rating=newRating; saveState(); render(); }
-      else db.collection('recipes').doc(r.id).update({rating:newRating});
+      else recipesCollection().doc(r.id).update({rating:newRating});
     };
     ratingWrap.appendChild(starBtn);
   }
@@ -2105,7 +2183,7 @@ function renderRecipeDetailPage(id){
   favBtn.onclick = ()=>{
     const newFav = !r.favorite;
     if(STORAGE_MODE==='local'){ r.favorite=newFav; saveState(); render(); }
-    else db.collection('recipes').doc(r.id).update({favorite:newFav});
+    else recipesCollection().doc(r.id).update({favorite:newFav});
   };
   ratingRow.appendChild(favBtn);
   metaCard.appendChild(ratingRow);
@@ -2273,9 +2351,199 @@ function renderLogisticsTab(){
   return wrap;
 }
 
+/* ============================================================
+   WEEK-PLANNING WIZARD
+   Proposes a full week at once (not slot-by-slot): scores every
+   candidate recipe per slot against the average daily target,
+   penalizes repeats for variety, and lets you swap any slot inline.
+   ============================================================ */
+let weekWizardPlan = null; // { weekday:{meal:recipeId}, weekend:{day:{meal:recipeId}} }
+let showWizard = false;
+
+function wizardAvgMealTarget(){
+  const avg = {
+    calories: ((STATE.profiles.A.goals.calories||0)+(STATE.profiles.B.goals.calories||0))/2,
+    protein: ((STATE.profiles.A.goals.protein||0)+(STATE.profiles.B.goals.protein||0))/2,
+    fiber: ((STATE.profiles.A.goals.fiber||0)+(STATE.profiles.B.goals.fiber||0))/2
+  };
+  return { calories: avg.calories/3, protein: avg.protein/3, fiber: avg.fiber/3 };
+}
+
+function wizardSlotList(){
+  const slots = [];
+  MEALS.forEach(m=> slots.push({type:'weekday', meal:m, label:`א'-ה' · ${m}`}));
+  DAYS_WEEKEND.forEach(d=> MEALS.forEach(m=> slots.push({type:'weekend', day:d, meal:m, label:`${d} · ${m}`})));
+  return slots;
+}
+
+function wizardScore(recipe, target, usageCount, jitter){
+  const ps = perServing(recipe);
+  const calDiff = Math.abs(ps.calories-target.calories)/Math.max(target.calories,1);
+  const proDiff = Math.abs(ps.protein-target.protein)/Math.max(target.protein,1);
+  const fibDiff = Math.abs(ps.fiber-target.fiber)/Math.max(target.fiber,1);
+  return calDiff*0.5 + proDiff*0.3 + fibDiff*0.2 + usageCount*0.4 + (jitter? Math.random()*0.08 : 0);
+}
+
+function buildWizardPlan(){
+  const target = wizardAvgMealTarget();
+  const usage = {};
+  const plan = { weekday:{}, weekend:{} };
+  DAYS_WEEKEND.forEach(d=> plan.weekend[d]={});
+
+  wizardSlotList().forEach(slot=>{
+    const candidates = STATE.recipes.filter(r=> r.mealType===slot.meal || r.mealType==='כל סוג');
+    const pool = candidates.length ? candidates : STATE.recipes;
+    if(pool.length===0) return;
+    let best=null, bestScore=Infinity;
+    pool.forEach(r=>{
+      const score = wizardScore(r, target, usage[r.id]||0, true);
+      if(score<bestScore){ bestScore=score; best=r; }
+    });
+    if(best){
+      usage[best.id] = (usage[best.id]||0)+1;
+      if(slot.type==='weekday') plan.weekday[slot.meal]=best.id;
+      else plan.weekend[slot.day][slot.meal]=best.id;
+    }
+  });
+  return plan;
+}
+
+function wizardGetSlotRecipeId(slot){
+  return slot.type==='weekday' ? weekWizardPlan.weekday[slot.meal] : weekWizardPlan.weekend[slot.day][slot.meal];
+}
+function wizardSetSlotRecipeId(slot, rid){
+  if(slot.type==='weekday') weekWizardPlan.weekday[slot.meal]=rid;
+  else weekWizardPlan.weekend[slot.day][slot.meal]=rid;
+}
+
+function wizardAlternatives(slot, currentId){
+  const target = wizardAvgMealTarget();
+  const candidates = STATE.recipes.filter(r=> (r.mealType===slot.meal || r.mealType==='כל סוג') && r.id!==currentId);
+  return candidates
+    .map(r=>({ r, score: wizardScore(r, target, 0, false) }))
+    .sort((a,b)=>a.score-b.score)
+    .slice(0,3)
+    .map(x=>x.r);
+}
+
+function computeWizardPlanAvg(){
+  let totals={calories:0,protein:0,fiber:0}, count=0;
+  DAYS.forEach(day=>{
+    MEALS.forEach(m=>{
+      const rid = DAYS_WEEKEND.includes(day) ? weekWizardPlan.weekend[day][m] : weekWizardPlan.weekday[m];
+      if(rid){ const r=recipeById(rid); if(r){ const ps=perServing(r); totals.calories+=ps.calories; totals.protein+=ps.protein; totals.fiber+=ps.fiber; count++; } }
+    });
+  });
+  return { calories: totals.calories/7, protein: totals.protein/7, fiber: totals.fiber/7, filled:count };
+}
+
+function applyWizardPlan(){
+  MEALS.forEach(m=>{ STATE.weekPlan.weekday[m].recipeId = weekWizardPlan.weekday[m]||null; });
+  DAYS_WEEKEND.forEach(d=> MEALS.forEach(m=>{ STATE.weekPlan.weekend[d][m].recipeId = weekWizardPlan.weekend[d][m]||null; }));
+  saveState();
+  showWizard = false; weekWizardPlan = null;
+  render();
+}
+
+let wizardOpenSwapKey = null;
+
+function renderWizardReview(){
+  const wrap = document.createElement('div');
+
+  const previewCard = document.createElement('div'); previewCard.className='card';
+  previewCard.style.border='2px solid var(--forest)';
+  const ph = document.createElement('h3'); ph.textContent='התאמה ליעדים (ממוצע יומי משוער)'; previewCard.appendChild(ph);
+  const avg = computeWizardPlanAvg();
+  ['A','B'].forEach(p=>{
+    const goals = STATE.profiles[p].goals;
+    const nameLbl = document.createElement('div'); nameLbl.style.fontWeight='700'; nameLbl.style.margin='8px 0 2px'; nameLbl.textContent = STATE.profiles[p].name;
+    previewCard.appendChild(nameLbl);
+    [['קלוריות','calories','קק"ל'],['חלבון','protein','g'],['סיבים','fiber','g']].forEach(([label,key,unit])=>{
+      const pct = goals[key] ? Math.min(100, Math.round(avg[key]/goals[key]*100)) : 0;
+      const over = avg[key] > goals[key]*1.15;
+      const pw = document.createElement('div'); pw.className='progress-wrap';
+      pw.innerHTML = `<div style="display:flex;justify-content:space-between;font-size:13px;"><span>${label}</span><span class="muted">${Math.round(avg[key])} / ${goals[key]} ${unit}</span></div>
+      <div class="progress-bar"><div class="progress-fill${over?' over':''}" style="width:${pct}%"></div></div>`;
+      previewCard.appendChild(pw);
+    });
+  });
+  wrap.appendChild(previewCard);
+
+  const actionsRow = document.createElement('div'); actionsRow.style.display='flex'; actionsRow.style.gap='8px'; actionsRow.style.marginBottom='14px';
+  const regenBtn = document.createElement('button'); regenBtn.className='secondary'; regenBtn.style.flex='1'; regenBtn.textContent='🎲 הצעה אחרת';
+  regenBtn.onclick = ()=>{ weekWizardPlan = buildWizardPlan(); wizardOpenSwapKey=null; render(); };
+  const cancelBtn = document.createElement('button'); cancelBtn.className='ghost'; cancelBtn.textContent='ביטול';
+  cancelBtn.onclick = ()=>{ showWizard=false; weekWizardPlan=null; render(); };
+  actionsRow.appendChild(regenBtn); actionsRow.appendChild(cancelBtn);
+  wrap.appendChild(actionsRow);
+
+  const listCard = document.createElement('div'); listCard.className='card';
+  const lh = document.createElement('h3'); lh.textContent='התפריט המוצע'; listCard.appendChild(lh);
+
+  wizardSlotList().forEach(slot=>{
+    const key = slot.type+'|'+(slot.day||'')+'|'+slot.meal;
+    const rid = wizardGetSlotRecipeId(slot);
+    const r = rid ? recipeById(rid) : null;
+    const row = document.createElement('div'); row.style.padding='9px 0'; row.style.borderBottom='1px solid var(--line)';
+    const topRow = document.createElement('div'); topRow.style.display='flex'; topRow.style.justifyContent='space-between'; topRow.style.alignItems='center'; topRow.style.gap='8px';
+    const info = document.createElement('div');
+    info.innerHTML = `<div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.04em;">${slot.label}</div><div style="font-weight:600;">${r?r.name:'— לא נמצא מתכון מתאים —'}</div>`;
+    topRow.appendChild(info);
+    const rightInfo = document.createElement('div'); rightInfo.style.display='flex'; rightInfo.style.alignItems='center'; rightInfo.style.gap='6px';
+    if(r){ const cal = document.createElement('span'); cal.className='muted'; cal.textContent=`${Math.round(perServing(r).calories)} קק"ל`; rightInfo.appendChild(cal); }
+    const swapBtn = document.createElement('button'); swapBtn.className='icon-btn'; swapBtn.style.width='38px'; swapBtn.style.height='38px'; swapBtn.style.fontSize='14px'; swapBtn.textContent='🔄';
+    swapBtn.onclick = ()=>{ wizardOpenSwapKey = (wizardOpenSwapKey===key) ? null : key; render(); };
+    rightInfo.appendChild(swapBtn);
+    topRow.appendChild(rightInfo);
+    row.appendChild(topRow);
+
+    if(wizardOpenSwapKey===key){
+      const alts = wizardAlternatives(slot, rid);
+      const altBox = document.createElement('div'); altBox.className='off-results'; altBox.style.marginTop='6px';
+      if(alts.length===0){
+        altBox.innerHTML = '<div class="muted" style="padding:6px;">אין חלופות מתאימות זמינות.</div>';
+      } else {
+        alts.forEach(alt=>{
+          const item = document.createElement('div'); item.className='off-result-item';
+          const label = document.createElement('span'); label.textContent = `${alt.name} · ${Math.round(perServing(alt).calories)} קק"ל`;
+          const btn = document.createElement('button'); btn.textContent='בחירה';
+          btn.onclick = ()=>{ wizardSetSlotRecipeId(slot, alt.id); wizardOpenSwapKey=null; render(); };
+          item.appendChild(label); item.appendChild(btn);
+          altBox.appendChild(item);
+        });
+      }
+      row.appendChild(altBox);
+    }
+    listCard.appendChild(row);
+  });
+  wrap.appendChild(listCard);
+
+  const applyBtn = document.createElement('button'); applyBtn.className='primary'; applyBtn.style.width='100%'; applyBtn.style.marginTop='10px';
+  applyBtn.textContent = '✅ החלת השבוע הזה';
+  applyBtn.onclick = applyWizardPlan;
+  wrap.appendChild(applyBtn);
+
+  return wrap;
+}
+
 function renderPlanTab(){
   const wrap = document.createElement('div');
   wrap.appendChild(renderWeekProgressBoth());
+
+  if(showWizard && weekWizardPlan){
+    wrap.appendChild(renderWizardReview());
+    return wrap;
+  }
+
+  const wizardBtn = document.createElement('button');
+  wizardBtn.className='primary'; wizardBtn.style.width='100%'; wizardBtn.style.marginBottom='10px';
+  wizardBtn.textContent = '🧙 בניית שבוע חכמה';
+  wizardBtn.onclick = ()=>{ weekWizardPlan = buildWizardPlan(); showWizard = true; render(); };
+  wrap.appendChild(wizardBtn);
+  const wizardNote = document.createElement('div'); wizardNote.className='muted'; wizardNote.style.marginBottom='14px';
+  wizardNote.textContent = 'האפליקציה מציעה תפריט מלא לשבוע לפי היעדים שלכם, ואפשר להחליף כל ארוחה בלחיצה - בלי לעבור סלוט-סלוט.';
+  wrap.appendChild(wizardNote);
+
   wrap.appendChild(renderWeekSummary());
 
   const toggleBtn = document.createElement('button');
@@ -2635,7 +2903,7 @@ async function archiveCurrentWeek(){
       await window.storage.set('app-state', JSON.stringify(STATE), false);
     } else {
       const toSave = Object.assign({}, STATE); delete toSave.recipes;
-      await db.collection('app').doc('sharedState').set(toSave, {merge:false});
+      await sharedStateDoc().set(toSave, {merge:false});
     }
   }catch(e){ alert('שגיאה בשמירת הארכיון: '+e.message); return; }
   planSubView = 'templates';
