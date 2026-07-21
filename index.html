@@ -11,6 +11,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-functions-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 
 <style>
@@ -217,13 +218,23 @@
               allow read, write: if request.auth != null && request.auth.uid == uid;
             }
             match /households/{householdId} {
-              allow read, write: if request.auth != null && myHousehold() == householdId;
+              // any signed-in user can check a single household ID exists
+              // (needed to validate a join-code before becoming a member) —
+              // this does NOT allow browsing/listing households, only
+              // looking up one you already have the (unguessable) code for.
+              allow get: if request.auth != null;
+              allow write: if request.auth != null && myHousehold() == householdId;
               match /{document=**} {
                 allow read, write: if request.auth != null && myHousehold() == householdId;
               }
             }
           }
         }
+
+      Note the create-order this depends on: when creating or joining a
+      household, the app writes users/{uid}.householdId BEFORE touching
+      the household doc itself — the household's write rule checks the
+      user's own membership, so that pointer has to exist first.
 
       This scopes data by household instead of hardcoded UIDs: each
       user document stores which household they belong to, and every
@@ -242,11 +253,12 @@ const firebaseConfig = {
 };
 
 const NEEDS_SETUP = firebaseConfig.apiKey === "REPLACE_ME";
-let auth = null, db = null;
+let auth = null, db = null, cloudFunctions = null;
 if(!NEEDS_SETUP){
   firebase.initializeApp(firebaseConfig);
   auth = firebase.auth();
   db = firebase.firestore();
+  cloudFunctions = firebase.functions();
 }
 const STORAGE_MODE = NEEDS_SETUP ? 'local' : 'firebase';
 let currentHouseholdId = null;
@@ -397,8 +409,11 @@ function renderHouseholdSetup(errorMsg){
   createBtn.onclick = async ()=>{
     const newId = uid()+uid();
     try{
-      await db.collection('households').doc(newId).set({ createdAt: Date.now() });
+      // write the membership pointer FIRST — the household doc's own security
+      // rule checks the user's membership, so it must already exist before
+      // the household doc can be created.
       await db.collection('users').doc(currentUser.uid).set({ householdId:newId, email: currentUser.email||'' });
+      await db.collection('households').doc(newId).set({ createdAt: Date.now() });
       currentHouseholdId = newId;
       startApp();
     }catch(e){ alert('שגיאה ביצירת בית: '+e.message); }
@@ -1588,20 +1603,14 @@ async function smartParseRecipe(){
   const raw = document.getElementById('paste-input').value.trim();
   const statusEl = document.getElementById('paste-status');
   if(!raw){ statusEl.textContent='אין טקסט להדביק.'; return; }
-  if(!STATE.geminiKey){ statusEl.textContent='צריך קודם להגדיר מפתח Gemini בטאב Gemini.'; return; }
+  if(STORAGE_MODE==='local' && !STATE.geminiKey){ statusEl.textContent='צריך קודם להגדיר מפתח Gemini בטאב עוזר AI.'; return; }
   statusEl.textContent = 'מפענחת עם Gemini...';
   const prompt = `אתה מקבל מתכון בעברית או באנגלית, מודבק כטקסט חופשי. החזר אך ורק JSON תקני (ללא מרקדאון) בפורמט:
 {"name":"...","yieldAmount":מספר,"yieldUnit":"...","unitsPerServing":מספר,"ingredients":[{"name":"...","amount":מספר,"unit":"..."}],"instructions":"...","tags":["..."]}
 טקסט המתכון:
 """${raw}"""`;
   try{
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(STATE.geminiKey)}`, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ contents:[{parts:[{text:prompt}]}], generationConfig:{responseMimeType:'application/json'} })
-    });
-    const data = await res.json();
-    if(data.error){ statusEl.textContent='שגיאה: '+data.error.message; return; }
-    const text = data.candidates[0].content.parts.map(p=>p.text).join('');
+    const text = await callGemini(prompt, true);
     const parsed = JSON.parse(text);
     draftRecipe.name = parsed.name || draftRecipe.name;
     draftRecipe.yieldAmount = parsed.yieldAmount || draftRecipe.yieldAmount;
@@ -1704,7 +1713,7 @@ async function bulkFillNutritionForImported(btnEl){
 async function bulkParseFreeTextIngredients(btnEl){
   const statusEl = document.getElementById('bulk-tools-status');
   const setStatus = (t)=>{ if(statusEl) statusEl.textContent=t; };
-  if(!STATE.geminiKey){ setStatus('צריך קודם להגדיר מפתח Gemini (בטאב עוזר AI).'); return; }
+  if(STORAGE_MODE==='local' && !STATE.geminiKey){ setStatus('צריך קודם להגדיר מפתח Gemini (בטאב עוזר AI).'); return; }
   const targets = STATE.recipes.filter(r=> r.ingredientsAreFreeText);
   if(targets.length===0){ setStatus('אין מתכונים שצריכים פירוק.'); return; }
   if(btnEl) btnEl.disabled = true;
@@ -1717,13 +1726,7 @@ async function bulkParseFreeTextIngredients(btnEl){
 שורות:
 ${lines.map((l,i)=>`${i+1}. ${l}`).join('\n')}`;
     try{
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(STATE.geminiKey)}`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ contents:[{parts:[{text:prompt}]}], generationConfig:{responseMimeType:'application/json'} })
-      });
-      const data = await res.json();
-      if(data.error) throw new Error(data.error.message);
-      const text = data.candidates[0].content.parts.map(p=>p.text).join('');
+      const text = await callGemini(prompt, true);
       const parsedLines = JSON.parse(text);
       const oldIngredients = r.ingredients||[];
       const newIngredients = oldIngredients.map((old, i)=>{
@@ -3047,7 +3050,7 @@ let semanticMergeSuggestions = null;
 async function suggestSemanticMerges(btnEl){
   const statusEl = document.getElementById('smart-merge-status');
   const setStatus = (t)=>{ if(statusEl) statusEl.textContent=t; };
-  if(!STATE.geminiKey){ setStatus('צריך קודם להגדיר מפתח Gemini (בטאב עוזר AI).'); return; }
+  if(STORAGE_MODE==='local' && !STATE.geminiKey){ setStatus('צריך קודם להגדיר מפתח Gemini (בטאב עוזר AI).'); return; }
   const agg = computeWeeklyIngredientAggregate();
   const items = Object.values(agg).map(it=>it.name);
   if(items.length<2){ setStatus('אין מספיק פריטים ברשימה כדי לחפש איחודים.'); return; }
@@ -3057,13 +3060,7 @@ async function suggestSemanticMerges(btnEl){
 רשימה:
 ${items.map((n,i)=>`${i+1}. ${n}`).join('\n')}`;
   try{
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(STATE.geminiKey)}`, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ contents:[{parts:[{text:prompt}]}], generationConfig:{responseMimeType:'application/json'} })
-    });
-    const data = await res.json();
-    if(data.error) throw new Error(data.error.message);
-    const text = data.candidates[0].content.parts.map(p=>p.text).join('');
+    const text = await callGemini(prompt, true);
     const parsed = JSON.parse(text);
     const groups = (parsed||[]).filter(g=> g.items && g.items.length>=2);
     if(groups.length===0){ setStatus('Gemini לא מצאה פריטים כפולים שכדאי לאחד השבוע.'); if(btnEl) btnEl.disabled=false; return; }
@@ -3512,18 +3509,49 @@ function renderPrepChecklistCard(){
 /* ============================================================
    GEMINI TAB
    ============================================================ */
+/* ============================================================
+   GEMINI ACCESS
+   In Firebase mode, calls go through a Cloud Function (callGemini)
+   so the API key lives only on the server, never in the browser.
+   In local preview mode (no Firebase configured yet) there's no
+   server to proxy through, so it falls back to a key pasted in the
+   app — that path is for testing only, never for real shared use.
+   ============================================================ */
+async function callGemini(prompt, jsonMode){
+  if(STORAGE_MODE==='firebase'){
+    if(!cloudFunctions) throw new Error('Cloud Functions לא זמין');
+    const fn = cloudFunctions.httpsCallable('callGemini');
+    const res = await fn({ prompt, jsonMode: !!jsonMode });
+    return res.data.text;
+  }
+  // local fallback (testing only — no server to hide the key behind)
+  if(!STATE.geminiKey) throw new Error('צריך להגדיר מפתח Gemini בטאב עוזר AI');
+  const body = { contents:[{parts:[{text:prompt}]}] };
+  if(jsonMode) body.generationConfig = { responseMimeType:'application/json' };
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(STATE.geminiKey)}`, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if(data.error) throw new Error(data.error.message);
+  return data.candidates[0].content.parts.map(p=>p.text).join('');
+}
+
 let geminiHistory = [];
 
 function renderGeminiTab(){
   const wrap = document.createElement('div');
   const keyCard = document.createElement('div'); keyCard.className='card';
-  keyCard.innerHTML = '<label>מפתח Gemini API (משותף לשניכם)</label>';
-  const keyInput = document.createElement('input'); keyInput.type='password'; keyInput.value=STATE.geminiKey||''; keyInput.placeholder='AIza...';
-  keyInput.onchange = ()=>{ STATE.geminiKey=keyInput.value.trim(); saveState(); };
-  keyCard.appendChild(keyInput);
-  const keyNote = document.createElement('div'); keyNote.className='muted'; keyNote.style.marginTop='4px';
-  keyNote.textContent = 'אפשר להשיג מפתח חינמי ב-Google AI Studio. גם מפעיל את הפענוח האוטומטי בטאב המתכונים.';
-  keyCard.appendChild(keyNote);
+  if(STORAGE_MODE==='firebase'){
+    keyCard.innerHTML = '<div style="display:flex;align-items:center;gap:8px;"><span style="font-size:18px;">🔒</span><b>מפתח Gemini מנוהל בצד השרת</b></div><div class="muted" style="margin-top:6px;">הבקשות עוברות דרך Cloud Function ב-Firebase — המפתח לא נחשף בדפדפן. צריך להגדיר אותו פעם אחת בפרויקט ה-Firebase (ראו הוראות בראש קובץ הקוד).</div>';
+  } else {
+    keyCard.innerHTML = '<label>מפתח Gemini API (מצב תצוגה מקומית — לבדיקה בלבד)</label>';
+    const keyInput = document.createElement('input'); keyInput.type='password'; keyInput.value=STATE.geminiKey||''; keyInput.placeholder='AIza...';
+    keyInput.onchange = ()=>{ STATE.geminiKey=keyInput.value.trim(); saveState(); };
+    keyCard.appendChild(keyInput);
+    const keyNote = document.createElement('div'); keyNote.className='muted'; keyNote.style.marginTop='4px';
+    keyNote.textContent = 'אפשר להשיג מפתח חינמי ב-Google AI Studio. זה רק לבדיקה מקומית — במצב משותף (Firebase) המפתח מנוהל בשרת ולא כאן.';
+    keyCard.appendChild(keyNote);
+  }
   wrap.appendChild(keyCard);
 
   const chatCard = document.createElement('div'); chatCard.className='card';
@@ -3571,21 +3599,15 @@ function escapeHtml(s){ return s.replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;'
 async function sendToGemini(){
   const ta = document.getElementById('gemini-input');
   const text = ta.value.trim(); if(!text) return;
-  if(!STATE.geminiKey){ alert('צריך להכניס קודם מפתח Gemini API למעלה.'); return; }
+  if(STORAGE_MODE==='local' && !STATE.geminiKey){ alert('צריך להכניס קודם מפתח Gemini API למעלה.'); return; }
   geminiHistory.push({role:'user', text}); ta.value=''; render(); setTab('gemini');
   const log = document.getElementById('gemini-log');
   const loadingDiv = document.createElement('div'); loadingDiv.className='gemini-msg muted'; loadingDiv.textContent='Gemini חושבת...';
   log.appendChild(loadingDiv); log.scrollTop = log.scrollHeight;
   try{
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(STATE.geminiKey)}`, {
-      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({contents:[{parts:[{text}]}]})
-    });
-    const data = await res.json();
-    let replyText = '(לא התקבלה תשובה)';
-    if(data && data.candidates && data.candidates[0] && data.candidates[0].content) replyText = data.candidates[0].content.parts.map(p=>p.text).join('\n');
-    else if(data && data.error) replyText = 'שגיאה: '+data.error.message;
+    const replyText = await callGemini(text, false);
     geminiHistory.push({role:'model', text:replyText});
-  }catch(e){ geminiHistory.push({role:'model', text:'שגיאת רשת: '+e.message}); }
+  }catch(e){ geminiHistory.push({role:'model', text:'שגיאה: '+e.message}); }
   render(); setTab('gemini');
 }
 
